@@ -78,6 +78,8 @@ def fetch_bullets():
     soup = BeautifulSoup(html, "html.parser")
     bullets = []
     for li in soup.find_all("li", class_="ww-item"):
+        if li.find(class_="wr_item_container"):
+            continue  # skip Worthy Reads section — different content, not wanted
         plain = li.get_text(separator=" ", strip=True)
         if len(plain) < MIN_BULLET_LENGTH:
             continue
