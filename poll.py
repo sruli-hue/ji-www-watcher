@@ -68,10 +68,13 @@ CYCLE = [2, 3, 4]          # escalation increments (hours), repeated forever
 DORMANT_HOURS = 72         # stop nudging if the page is static longer than this
 SKIP_SATURDAY = True       # no nudges on Saturday (America/New_York)
 TZ = ZoneInfo("America/New_York")
-NUDGE_TEXT = (
-    "What's happening now that readers need to know? Make sure to put it up on "
-    "the Live Briefing — it's been a bit since the last update."
-)
+def nudge_text(elapsed_h):
+    hrs = round(elapsed_h)
+    unit = "hour" if hrs == 1 else "hours"
+    return (
+        "What's happening now that readers need to know? Make sure to put it up "
+        f"on the Live Briefing — it's been about {hrs} {unit} since the last update."
+    )
 
 
 def cumulative_offset(n):
@@ -224,7 +227,7 @@ def maybe_nudge(state, now):
     print(f"{elapsed_h:.2f}h since last new entry; {state['nudges']} nudge(s) sent; "
           f"next due at {due_at}h.")
     if elapsed_h >= due_at:
-        post_to_slack(LIVE_BRIEFING_WEBHOOK, NUDGE_TEXT)
+        post_to_slack(LIVE_BRIEFING_WEBHOOK, nudge_text(elapsed_h))
         state["nudges"] += 1
         print(f"Posted nudge #{state['nudges'] - 1}.")
     return state
