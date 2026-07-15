@@ -21,5 +21,6 @@ jobs:
       - run: python3 poll.py
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          LIVE_BRIEFING_WEBHOOK: ${{ secrets.LIVE_BRIEFING_WEBHOOK }}
           JI_COOKIE: ${{ secrets.JI_COOKIE }}
           JI_BYPASS_TOKEN: ${{ secrets.JI_BYPASS_TOKEN }}

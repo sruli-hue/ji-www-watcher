@@ -1,16 +1,35 @@
 #!/usr/bin/env python3
 """
-Single-shot poller: fetches the JI "What We're Watching" page and posts any
-newly added bullets to Slack. Runs once per GitHub Actions invocation.
+Single-shot poller for the JI "What We're Watching" / Live Briefing page.
 
-Auth: sends JI_COOKIE (a full subscriber Cookie header) so the page renders
-the live subscriber list rather than the public morning-Kickoff snapshot.
-Also sends X-JI-Watcher-Token (JI_BYPASS_TOKEN) if set, so JI's Cloudflare
-allowlists this watcher past its bot block.
+Two jobs, every run:
 
-State: seen bullet IDs live in watcher_state.json, committed back to the repo
-after each run. Concurrent-run safe: re-reads freshest state from origin/main
-right before each post, and commits with a merge-and-retry loop on push.
+1. WWW watcher (unchanged): posts any newly added bullets to the main Slack
+   webhook (SLACK_WEBHOOK_URL).
+
+2. Live Briefing nudge: if the page has gone too long without a NEW entry, it
+   nudges the #live-briefing channel (LIVE_BRIEFING_WEBHOOK). Escalation, measured
+   from the last new entry:
+
+       nudge #0 at  2h of silence
+       nudge #1 at  5h   (+3h)
+       nudge #2 at  9h   (+4h)
+       nudge #3 at 11h   (+2h, cycle restarts)
+       ...  the 2/3/4-hour cycle repeats.
+
+   As soon as a new entry appears, the clock resets to zero. Never posts on
+   Saturday (America/New_York) — see SKIP_SATURDAY. If the page has been static
+   longer than DORMANT_HOURS, it stops nudging until something new appears.
+
+Auth: sends JI_COOKIE (a full subscriber Cookie header) so the page renders the
+live subscriber list rather than the public morning-Kickoff snapshot. Also sends
+X-JI-Watcher-Token (JI_BYPASS_TOKEN) if set, so JI's Cloudflare allowlists this
+watcher past its bot block.
+
+State (watcher_state.json, committed back to the repo after each run):
+  { "seen": [bullet ids...], "last_new": <epoch when a new bullet last appeared>,
+    "nudges": <how many nudges sent since that last new bullet> }
+Legacy state files (a bare JSON array of ids) are migrated automatically.
 """
 
 import hashlib
@@ -18,12 +37,16 @@ import json
 import os
 import re
 import subprocess
+import time
+from datetime import datetime
 from pathlib import Path
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+LIVE_BRIEFING_WEBHOOK = os.environ.get("LIVE_BRIEFING_WEBHOOK", "")
 JI_COOKIE = os.environ.get("JI_COOKIE", "")
 BYPASS_TOKEN = os.environ.get("JI_BYPASS_TOKEN", "")
 
@@ -39,6 +62,21 @@ GIT_ID = [
     "-c", "user.name=github-actions[bot]",
     "-c", "user.email=github-actions[bot]@users.noreply.github.com",
 ]
+
+# --- Live Briefing nudge config ---
+CYCLE = [2, 3, 4]          # escalation increments (hours), repeated forever
+DORMANT_HOURS = 72         # stop nudging if the page is static longer than this
+SKIP_SATURDAY = True       # no nudges on Saturday (America/New_York)
+TZ = ZoneInfo("America/New_York")
+NUDGE_TEXT = (
+    "What's happening now that readers need to know? Make sure to put it up on "
+    "the Live Briefing — it's been a bit since the last update."
+)
+
+
+def cumulative_offset(n):
+    """Hours of silence at which the n-th nudge (0-indexed) is due."""
+    return sum(CYCLE[i % len(CYCLE)] for i in range(n + 1))
 
 
 def slack_escape(text):
@@ -97,19 +135,33 @@ def bullet_id(text):
     return hashlib.md5(normalized.encode()).hexdigest()
 
 
-def _parse(text):
+def _parse_state(text):
+    """Return {'seen': set, 'last_new': float|None, 'nudges': int}. Migrates the
+    legacy format (a bare JSON array of ids)."""
     try:
-        return set(json.loads(text))
+        data = json.loads(text)
     except Exception:
-        return set()
+        return {"seen": set(), "last_new": None, "nudges": 0}
+    if isinstance(data, list):  # legacy: just the seen ids
+        return {"seen": set(data), "last_new": None, "nudges": 0}
+    return {
+        "seen": set(data.get("seen", [])),
+        "last_new": data.get("last_new"),
+        "nudges": data.get("nudges", 0),
+    }
 
 
-def load_seen():
-    return _parse(STATE_FILE.read_text()) if STATE_FILE.exists() else set()
+def load_state():
+    return _parse_state(STATE_FILE.read_text()) if STATE_FILE.exists() else \
+        {"seen": set(), "last_new": None, "nudges": 0}
 
 
-def save_seen(seen):
-    STATE_FILE.write_text(json.dumps(sorted(seen)[-500:]))
+def save_state(state):
+    STATE_FILE.write_text(json.dumps({
+        "seen": sorted(state["seen"])[-500:],
+        "last_new": state["last_new"],
+        "nudges": state["nudges"],
+    }))
 
 
 def git(*args):
@@ -118,19 +170,25 @@ def git(*args):
     )
 
 
-def latest_seen():
+def latest_state():
+    """Freshest committed state from origin."""
     git("fetch", "-q", "origin", "main")
     r = git("show", "origin/main:watcher_state.json")
-    return _parse(r.stdout) if r.returncode == 0 else load_seen()
+    return _parse_state(r.stdout) if r.returncode == 0 else load_state()
 
 
-def record(seen):
+def record(state):
+    """Push state; union the seen-set with origin's, keep our nudge metadata.
+    Retries on a concurrent-push race."""
     for _ in range(5):
         git("fetch", "-q", "origin", "main")
         remote = git("show", "origin/main:watcher_state.json")
-        merged = seen | (_parse(remote.stdout) if remote.returncode == 0 else set())
+        rstate = _parse_state(remote.stdout) if remote.returncode == 0 else \
+            {"seen": set()}
+        merged = dict(state)
+        merged["seen"] = set(state["seen"]) | rstate.get("seen", set())
         git("reset", "-q", "--hard", "origin/main")
-        save_seen(merged)
+        save_state(merged)
         git("add", "watcher_state.json")
         if git("diff", "--cached", "--quiet").returncode == 0:
             return
@@ -139,12 +197,37 @@ def record(seen):
             return
 
 
-def post_to_slack(text):
+def post_to_slack(webhook, text):
     body = json.dumps({"text": text}).encode()
     urlopen(
-        Request(WEBHOOK_URL, data=body, headers={"Content-Type": "application/json"}),
+        Request(webhook, data=body, headers={"Content-Type": "application/json"}),
         timeout=15,
     ).read()
+
+
+def maybe_nudge(state, now):
+    """Post the Live Briefing nudge if one is due. Mutates and returns state."""
+    if not LIVE_BRIEFING_WEBHOOK:
+        print("LIVE_BRIEFING_WEBHOOK not set — skipping nudge check.")
+        return state
+    if SKIP_SATURDAY and datetime.fromtimestamp(now, TZ).weekday() == 5:
+        print("It's Saturday (ET) — no nudge.")
+        return state
+
+    last_new = state["last_new"] or now
+    elapsed_h = (now - last_new) / 3600
+    if elapsed_h > DORMANT_HOURS:
+        print(f"Page static {elapsed_h:.1f}h (> {DORMANT_HOURS}h) — dormant, no nudge.")
+        return state
+
+    due_at = cumulative_offset(state["nudges"])
+    print(f"{elapsed_h:.2f}h since last new entry; {state['nudges']} nudge(s) sent; "
+          f"next due at {due_at}h.")
+    if elapsed_h >= due_at:
+        post_to_slack(LIVE_BRIEFING_WEBHOOK, NUDGE_TEXT)
+        state["nudges"] += 1
+        print(f"Posted nudge #{state['nudges'] - 1}.")
+    return state
 
 
 def main():
@@ -155,40 +238,55 @@ def main():
         print("JI_COOKIE not set — would only see public snapshot. Aborting.")
         return
 
+    now = time.time()
     bullets = fetch_bullets()
     print(f"Fetched {len(bullets)} bullets from page.")
+    current_ids = {bullet_id(plain) for plain, _ in bullets}
 
     if not STATE_FILE.exists():
-        seen = {bullet_id(plain) for plain, _ in bullets}
-        save_seen(seen)
+        # First ever run — baseline silently, start the nudge clock now.
+        state = {"seen": current_ids, "last_new": now, "nudges": 0}
+        save_state(state)
         post_to_slack(
+            WEBHOOK_URL,
             f":eyes: Watcher is live on <{PAGE_URL}|What We're Watching> "
-            f"(tracking {len(bullets)} existing bullets). New updates will appear here."
+            f"(tracking {len(bullets)} existing bullets). New updates will appear here.",
         )
-        record(seen)
+        record(state)
         print(f"First run — baseline of {len(bullets)} bullets saved.")
         return
 
+    prev = latest_state()
+    seen = set(prev["seen"])
     new_bullets = [(bid, formatted) for plain, formatted in bullets
-                   if (bid := bullet_id(plain)) not in latest_seen()]
+                   if (bid := bullet_id(plain)) not in seen]
 
-    if not new_bullets:
-        print("No new bullets.")
+    if new_bullets:
+        # New entries → post them and RESET the nudge clock.
+        for bid, formatted in new_bullets:
+            post_to_slack(
+                WEBHOOK_URL,
+                f":newspaper: *New on <{PAGE_URL}|What We're Watching>:*\n{formatted}",
+            )
+            seen.add(bid)
+        state = {"seen": seen, "last_new": now, "nudges": 0}
+        save_state(state)
+        record(state)
+        print(f"Posted {len(new_bullets)} new bullet(s); nudge clock reset.")
         return
 
-    posted = 0
-    for bid, formatted in new_bullets:
-        seen = latest_seen()
-        if bid in seen:
-            continue
-        post_to_slack(
-            f":newspaper: *New on <{PAGE_URL}|What We're Watching>:*\n{formatted}"
-        )
-        seen.add(bid)
-        save_seen(seen)
-        record(seen)
-        posted += 1
-    print(f"Posted {posted} new bullet(s).")
+    # Nothing new → carry the clock forward and nudge if it's time.
+    state = {"seen": seen, "last_new": prev["last_new"], "nudges": prev["nudges"]}
+    before = state["nudges"]
+    state = maybe_nudge(state, now)
+    if state["nudges"] != before or prev["last_new"] is None:
+        # Persist a bumped nudge count (or backfill last_new on a migrated file).
+        if prev["last_new"] is None:
+            state["last_new"] = now
+        save_state(state)
+        record(state)
+    else:
+        print("No new bullets; no nudge due.")
 
 
 if __name__ == "__main__":

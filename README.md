@@ -7,6 +7,16 @@ Slack channel, within ~5–15 minutes of publish.
 Runs 24/7 as a scheduled GitHub Actions workflow — it does **not** depend on any
 personal machine being on.
 
+## Live Briefing nudge
+
+The same run also nudges the **#live-briefing** channel when the page has gone
+too long without a **new** entry, so the Live Briefing never goes stale
+unnoticed. Escalation, measured from the last new entry: **2h → 5h → 9h → 11h →
+14h → 18h …** (a repeating 2 / 3 / 4-hour cycle). A new entry resets the clock to
+zero. It never posts on **Saturday** (ET), and stops nudging entirely if the page
+has been static longer than 72h (`DORMANT_HOURS`). Set `LIVE_BRIEFING_WEBHOOK` to
+turn it on; leave it unset and only the WWW-watcher posting runs.
+
 ## Cookie refresh (every ~2 months)
 
 The page shows the full live list only to logged-in subscribers, so the workflow
@@ -22,7 +32,9 @@ Kickoff snapshot (short posts) instead of the full list, refresh the cookie:
 
 ## Secrets
 
-- `SLACK_WEBHOOK_URL` — incoming webhook for the target channel.
+- `SLACK_WEBHOOK_URL` — incoming webhook for the target channel (WWW bullets).
+- `LIVE_BRIEFING_WEBHOOK` — incoming webhook for **#live-briefing** (nudges).
+  Optional; nudging is skipped if unset.
 - `JI_COOKIE` — full subscriber Cookie header for jewishinsider.com.
 - `JI_BYPASS_TOKEN` — optional, sent as `X-JI-Watcher-Token` for Cloudflare
   allowlisting. Add if requests start getting blocked from GitHub's IPs.
