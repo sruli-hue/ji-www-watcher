@@ -161,26 +161,30 @@ def _parse_state(text):
     except Exception:
         return {"seen": set(), "last_new": None, "nudges": 0}
     if isinstance(data, list):  # legacy: just the seen ids
-        return {"seen": set(data), "last_new": None, "nudges": 0, "alerted_at": None}
+        return {"seen": set(data), "last_new": None, "nudges": 0,
+                "alerted_at": None, "page_updated": None}
     return {
         "seen": set(data.get("seen", [])),
         "last_new": data.get("last_new"),
         "nudges": data.get("nudges", 0),
         "alerted_at": data.get("alerted_at"),
+        "page_updated": data.get("page_updated"),
     }
 
 
 def load_state():
     return _parse_state(STATE_FILE.read_text()) if STATE_FILE.exists() else \
-        {"seen": set(), "last_new": None, "nudges": 0, "alerted_at": None}
+        {"seen": set(), "last_new": None, "nudges": 0,
+         "alerted_at": None, "page_updated": None}
 
 
 def save_state(state):
     STATE_FILE.write_text(json.dumps({
         "seen": sorted(state["seen"])[-500:],
-        "last_new": state["last_new"],
+        "last_new": state.get("last_new"),
         "nudges": state["nudges"],
         "alerted_at": state.get("alerted_at"),
+        "page_updated": state.get("page_updated"),
     }))
 
 
@@ -232,6 +236,27 @@ def body_class(html):
     return m.group(1).lower() if m else ""
 
 
+def parse_page_updated(html):
+    """Epoch (seconds) of the page's own '<div class="ww-updated"> Last updated
+    <Month> <D>, <YYYY> - <H:MM> <AM/PM> ET' banner — the editors' own last-touch
+    time, which is what the Live Briefing nudge measures staleness against.
+    Returns None if the banner is missing or unparseable. Interpreted in ET."""
+    soup = BeautifulSoup(html, "html.parser")
+    el = soup.find(class_="ww-updated")
+    text = el.get_text(" ", strip=True) if el else ""
+    m = re.search(r"Last updated\s+(.+?)\s*ET\b", text, re.IGNORECASE)
+    if not m:
+        return None
+    # e.g. "July 16, 2026 - 12:56 PM" -> "July 16 2026 12:56 PM"
+    stamp = " ".join(m.group(1).replace("-", " ").replace(",", " ").split())
+    for fmt in ("%B %d %Y %I:%M %p", "%b %d %Y %I:%M %p"):
+        try:
+            return datetime.strptime(stamp, fmt).replace(tzinfo=TZ).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
 # Verified 2026-07-16 against a real authenticated Actions run: the subscriber
 # page's <body> carries 'logged-in' and NOT 'freeuser'; the logged-out/expired-
 # cookie page carries 'freeuser'. So blocking on 'freeuser' cannot false-positive
@@ -280,24 +305,37 @@ def alert_auth_failure(state, now):
     print("Posted auth-failure alert.")
 
 
-def maybe_nudge(state, now):
-    """Post the Live Briefing nudge if one is due. Mutates and returns state."""
+def maybe_nudge(state, now, page_updated_ts):
+    """Post the Live Briefing nudge if one is due, measuring staleness against the
+    page's OWN 'Last updated' time (page_updated_ts) — not our hash-based bullet
+    detection, which a mid-bullet edit would falsely trip. The nudge count resets
+    only when that timestamp actually advances. Mutates and returns state."""
     if not LIVE_BRIEFING_WEBHOOK:
         print("LIVE_BRIEFING_WEBHOOK not set — skipping nudge check.")
         return state
+    if page_updated_ts is None:
+        print("No page 'Last updated' time — cannot measure staleness, skipping nudge.")
+        return state
+
+    # A genuinely newer page-update time = fresh content → restart the clock.
+    if state.get("page_updated") != page_updated_ts:
+        state["page_updated"] = page_updated_ts
+        state["nudges"] = 0
+
     if SKIP_SATURDAY and datetime.fromtimestamp(now, TZ).weekday() == 5:
         print("It's Saturday (ET) — no nudge.")
         return state
 
-    last_new = state["last_new"] or now
-    elapsed_h = (now - last_new) / 3600
+    elapsed_h = (now - page_updated_ts) / 3600
+    stamp = datetime.fromtimestamp(page_updated_ts, TZ).strftime("%-I:%M %p ET")
     if elapsed_h > DORMANT_HOURS:
-        print(f"Page static {elapsed_h:.1f}h (> {DORMANT_HOURS}h) — dormant, no nudge.")
+        print(f"Page last updated {stamp}, {elapsed_h:.1f}h ago (> {DORMANT_HOURS}h) "
+              f"— dormant, no nudge.")
         return state
 
     due_at = cumulative_offset(state["nudges"])
-    print(f"{elapsed_h:.2f}h since last new entry; {state['nudges']} nudge(s) sent; "
-          f"next due at {due_at}h.")
+    print(f"Page last updated {stamp}, {elapsed_h:.2f}h ago; "
+          f"{state['nudges']} nudge(s) sent; next due at {due_at}h.")
     if elapsed_h >= due_at:
         post_to_slack(LIVE_BRIEFING_WEBHOOK, nudge_text(elapsed_h))
         state["nudges"] += 1
@@ -328,11 +366,19 @@ def main():
         alert_auth_failure(prev, now)
         return
 
+    page_updated_ts = parse_page_updated(html)
+    if page_updated_ts:
+        print("Page 'Last updated' = "
+              f"{datetime.fromtimestamp(page_updated_ts, TZ).strftime('%Y-%m-%d %-I:%M %p ET')}")
+    else:
+        print("Could not parse the page's 'Last updated' banner.")
+
     current_ids = {bullet_id(plain) for plain, _ in bullets}
 
     if not STATE_FILE.exists():
         # First ever run — baseline silently, start the nudge clock now.
-        state = {"seen": current_ids, "last_new": now, "nudges": 0}
+        state = {"seen": current_ids, "last_new": now, "nudges": 0,
+                 "page_updated": page_updated_ts}
         save_state(state)
         post_to_slack(
             WEBHOOK_URL,
@@ -348,32 +394,36 @@ def main():
     new_bullets = [(bid, formatted) for plain, formatted in bullets
                    if (bid := bullet_id(plain)) not in seen]
 
-    if new_bullets:
-        # New entries → post them and RESET the nudge clock.
-        for bid, formatted in new_bullets:
-            post_to_slack(
-                WEBHOOK_URL,
-                f":newspaper: *New on <{PAGE_URL}|What We're Watching>:*\n{formatted}",
-            )
-            seen.add(bid)
-        state = {"seen": seen, "last_new": now, "nudges": 0}
-        save_state(state)
-        record(state)
-        print(f"Posted {len(new_bullets)} new bullet(s); nudge clock reset.")
-        return
+    # Post any newly-seen bullets to Slack (hash-based surfacing of new items).
+    # This no longer touches the nudge clock — the nudge is driven purely by the
+    # page's own 'Last updated' time below, so a mid-bullet edit can't reset it.
+    posted = 0
+    for bid, formatted in new_bullets:
+        post_to_slack(
+            WEBHOOK_URL,
+            f":newspaper: *New on <{PAGE_URL}|What We're Watching>:*\n{formatted}",
+        )
+        seen.add(bid)
+        posted += 1
+    if posted:
+        print(f"Posted {posted} new bullet(s) to Slack.")
 
-    # Nothing new → carry the clock forward and nudge if it's time.
-    state = {"seen": seen, "last_new": prev["last_new"], "nudges": prev["nudges"]}
-    before = state["nudges"]
-    state = maybe_nudge(state, now)
-    if state["nudges"] != before or prev["last_new"] is None:
-        # Persist a bumped nudge count (or backfill last_new on a migrated file).
-        if prev["last_new"] is None:
-            state["last_new"] = now
+    # Live Briefing nudge — measured against the page's own last-updated time.
+    state = {
+        "seen": seen,
+        "last_new": prev.get("last_new"),
+        "nudges": prev.get("nudges", 0),
+        "alerted_at": prev.get("alerted_at"),
+        "page_updated": prev.get("page_updated"),
+    }
+    before = (state["nudges"], state.get("page_updated"))
+    state = maybe_nudge(state, now, page_updated_ts)
+    after = (state["nudges"], state.get("page_updated"))
+    if posted or after != before:
         save_state(state)
         record(state)
     else:
-        print("No new bullets; no nudge due.")
+        print("Nothing new to post; no nudge due.")
 
 
 if __name__ == "__main__":
