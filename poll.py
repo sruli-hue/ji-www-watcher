@@ -40,6 +40,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -129,8 +130,25 @@ def fetch_bullets():
         headers["Cookie"] = JI_COOKIE
     if BYPASS_TOKEN:
         headers["X-JI-Watcher-Token"] = BYPASS_TOKEN
-    with urlopen(Request(PAGE_URL, headers=headers), timeout=30) as r:
-        html = r.read().decode()
+    # Retry transient JI-side hiccups (5xx, network timeouts, connection resets)
+    # so a brief upstream blip doesn't fail the whole run. Give up on 4xx
+    # (401/403 = cookie problem — retrying won't help; let it bubble up).
+    last_err = None
+    for attempt in range(3):
+        try:
+            with urlopen(Request(PAGE_URL, headers=headers), timeout=30) as r:
+                html = r.read().decode()
+            break
+        except HTTPError as e:
+            last_err = e
+            if e.code < 500:
+                raise  # 4xx — real problem, don't paper over it
+        except (URLError, TimeoutError) as e:
+            last_err = e
+        if attempt < 2:
+            time.sleep(3 + 2 * attempt)  # 3s, 5s
+    else:
+        raise last_err
     soup = BeautifulSoup(html, "html.parser")
     bullets = []
     for li in soup.find_all("li", class_="ww-item"):
