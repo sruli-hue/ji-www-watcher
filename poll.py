@@ -8,14 +8,9 @@ Two jobs, every run:
    webhook (SLACK_WEBHOOK_URL).
 
 2. Live Briefing nudge: if the page has gone too long without a NEW entry, it
-   nudges the #live-briefing channel (LIVE_BRIEFING_WEBHOOK). Escalation, measured
-   from the last new entry:
-
-       nudge #0 at  2h of silence
-       nudge #1 at  5h   (+3h)
-       nudge #2 at  9h   (+4h)
-       nudge #3 at 11h   (+2h, cycle restarts)
-       ...  the 2/3/4-hour cycle repeats.
+   nudges the #live-briefing channel (LIVE_BRIEFING_WEBHOOK) once every 8 hours
+   of staleness — first at 8h, then 16h, 24h, ... — measured from the page's
+   last-updated banner.
 
    As soon as a new entry appears, the clock resets to zero. Never posts on
    Saturday (America/New_York) — see SKIP_SATURDAY. If the page has been static
@@ -65,7 +60,7 @@ GIT_ID = [
 ]
 
 # --- Live Briefing nudge config ---
-CYCLE = [2, 3, 4]          # escalation increments (hours), repeated forever
+CYCLE = [8]                # nudge every 8h of staleness (8h, 16h, 24h, ...)
 DORMANT_HOURS = 72         # stop nudging if the page is static longer than this
 SKIP_SATURDAY = True       # no nudges on Saturday (America/New_York)
 TZ = ZoneInfo("America/New_York")
